@@ -7,11 +7,7 @@
 ![QS-Tunnel demo](q.jpg)
 
 <br/>
-<br/>
 
-![QS-Tunnel demo](QS-Tunnel-demo.gif)
-
-<br/>
 
 [![Version](https://img.shields.io/badge/▶VERSION-1.0.0-00f5ff?style=for-the-badge&labelColor=020510)](https://github.com/Qteam-official/QS-Tunnel/releases)
 [![Go](https://img.shields.io/badge/▶BUILT_WITH-Go_1.21+-00ADD8?style=for-the-badge&labelColor=020510&logo=go&logoColor=white)](https://golang.org)
@@ -24,6 +20,39 @@
 [![YouTube](https://img.shields.io/badge/YOUTUBE-@Q-TEAM-official-FF0000?style=for-the-badge&labelColor=020510&logo=youtube)](https://youtube.com/@Q-TEAM-official)
 
 <br/>
+
+<div align="center">
+
+# ⚠️ Research Project Notice
+
+</div>
+
+---
+
+## 📌 Disclaimer
+
+This project is intended strictly for research and educational purposes.  
+
+We do not take any responsibility for misuse, abuse, or illegal activities performed using this project.  
+Users are fully responsible for how they use the software.
+
+⚠️ In some countries or regions, using this project improperly — especially for commercial VPN-related activities — may lead to legal consequences.
+
+---
+
+## 🚧 Important Notice
+
+> Please DO NOT use the transport or mode obfs feature yet.
+
+This section is still under development and has not been fully completed or tested.
+
+---
+
+<div align="center">
+
+### ⭐ Use Carefully & Responsibly
+
+</div>
 
 > **`🇮🇷`** [**مستندات فارسی**](#-مستندات-فارسی) &nbsp;`//`&nbsp; **`🇬🇧`** [**English Docs**](#-english-documentation)
 
@@ -71,7 +100,6 @@
 ├────────────────────────────┼────────┼──────────────────────────────────────┤
 │ Split upload/download      │  [ON]  │ TCP up · UDP down                    │
 │ IP Spoof (AF_PACKET)       │  [ON]  │ Raw socket · like hping3             │
-│ Obfs mode (QUIC-like)      │  [ON]  │ AES-256-GCM · port 443              │
 │ Auto reconnect             │  [ON]  │ TCP drops? streams survive           │
 │ Flow control               │  [ON]  │ AIMD window + token bucket           │
 │ Auto IP detection          │  [ON]  │ public IP · gateway · interface      │
@@ -95,7 +123,7 @@ cd QS-Tunnel
 go build -o bin/server ./cmd/server
 go build -o bin/client ./cmd/client
 
-# ── Generate obfs key (copy to both configs) ───────────────────
+# ── Generate obfs key (copy to both configs) ─────────────────── 
 ./bin/client --gen-key
 # → 🔑 a3f8c2d1e4b5...
 
@@ -120,7 +148,7 @@ sudo ./bin/server --config server.json
 {
   "listen_addr":            "0.0.0.0:9000",   // TCP listen
   "download_src_port":      9001,              // UDP output port
-  "transport_mode":         "udp",             // "udp" | "obfs"
+  "transport_mode":         "udp",             // "udp"
   "obfs_key":               "",               // 64-char hex (gen-key)
   "spoof_ip":               "",               // fake source IP for UDP
   "spoof_interface":        "",               // auto-detect if empty
@@ -148,7 +176,7 @@ sudo ./bin/server --config server.json
   "local_socks":    "127.0.0.1:1080",         // browser connects here
   "download_port":  8000,                     // UDP listen port
   "my_public_ip":   "",                       // auto-detected if empty ✨
-  "transport_mode": "udp",                    // "udp" | "obfs"
+  "transport_mode": "udp",                    // "udp"
   "obfs_key":       "",                       // must match server
   "max_streams":    512,
   "metrics_addr":   "127.0.0.1:9091",
