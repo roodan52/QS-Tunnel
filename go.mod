@@ -1,3 +1,3 @@
-module github.com/sttunnel
+module github.com/Qteam-official/QS-Tunnel
 
 go 1.21
