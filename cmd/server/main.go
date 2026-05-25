@@ -1,14 +1,16 @@
 // سرور split-tunnel
 //
 // معماری جدید کلاینت:
-//   هر stream = یه TCP connection مستقل
-//   Hello پیام اول هر TCP با sessionID مشترک
-//   سرور sessionID‌ها رو گروه‌بندی میکنه → یه session
-//   UDP دانلود به IP:port کلاینت (از Hello)
+//
+//	هر stream = یه TCP connection مستقل
+//	Hello پیام اول هر TCP با sessionID مشترک
+//	سرور sessionID‌ها رو گروه‌بندی میکنه → یه session
+//	UDP دانلود به IP:port کلاینت (از Hello)
 package main
 
 import (
 	"context"
+	cryptoRand "crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -23,20 +25,48 @@ import (
 	"syscall"
 	"time"
 
-	cfgpkg "github.com/sttunnel/internal/config"
-	"github.com/sttunnel/internal/limit"
-	"github.com/sttunnel/internal/metrics"
-	"github.com/sttunnel/internal/pool"
-	"github.com/sttunnel/internal/proto"
-	"github.com/sttunnel/internal/sendpool"
-	"github.com/sttunnel/internal/session"
-	"github.com/sttunnel/internal/spoof"
-	"github.com/sttunnel/internal/transport"
+	cfgpkg "github.com/Qteam-official/QS-Tunnel/internal/config"
+	"github.com/Qteam-official/QS-Tunnel/internal/dashboard"
+	"github.com/Qteam-official/QS-Tunnel/internal/dnscache"
+	"github.com/Qteam-official/QS-Tunnel/internal/limit"
+	"github.com/Qteam-official/QS-Tunnel/internal/metrics"
+	"github.com/Qteam-official/QS-Tunnel/internal/mtu"
+	"github.com/Qteam-official/QS-Tunnel/internal/pool"
+	"github.com/Qteam-official/QS-Tunnel/internal/proto"
+	"github.com/Qteam-official/QS-Tunnel/internal/sendpool"
+	"github.com/Qteam-official/QS-Tunnel/internal/session"
+	"github.com/Qteam-official/QS-Tunnel/internal/spoof"
+	"github.com/Qteam-official/QS-Tunnel/internal/transport"
 )
 
 var (
 	M       = metrics.New()
 	idleDur = 2 * time.Minute
+
+	// udpFramePool — بازاستفاده از frame buffer برای ارسال UDP
+	// هر worker سرور یه pool مجزا داره → کاهش contention
+	udpFramePool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 2048)
+			return &b
+		},
+	}
+
+	// rbufPool — read buffer از dst connection
+	rbufPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024) // 32KB — بزرگ‌تر برای throughput
+			return &b
+		},
+	}
+
+	// writePool — buffer برای TCP write coalescing
+	writePool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 64*1024)
+			return &b
+		},
+	}
 )
 
 // ─── session: یه کلاینت = یه sessionID ──────────────────────────────────────
@@ -44,69 +74,50 @@ var (
 // UDP دانلود همه به یه udpDst میره
 
 type clientSession struct {
-	id        [proto.SessionIDLen]byte
-	udpDst    *net.UDPAddr
-	sender    *sendpool.Pool
+	id          [proto.SessionIDLen]byte
+	udpDst      *net.UDPAddr
+	sender      *sendpool.Pool
 	activeConns atomic.Int64
 }
 
 // ─── sessionManager: نگه‌داری session‌ها ────────────────────────────────────
 
 type sessionManager struct {
-	mu       sync.RWMutex
-	sessions map[[proto.SessionIDLen]byte]*clientSession
+	sessions sync.Map // [proto.SessionIDLen]byte → *clientSession
 	limit    *limit.ConnCounter
 }
 
 func newSessionManager(maxClients int) *sessionManager {
 	return &sessionManager{
-		sessions: make(map[[proto.SessionIDLen]byte]*clientSession),
-		limit:    limit.NewConnCounter(maxClients),
+		limit: limit.NewConnCounter(maxClients),
 	}
 }
 
-// getOrCreate یه session پیدا یا میسازه
+// getOrCreate یه session پیدا یا میسازه — lock-free با sync.Map
 func (sm *sessionManager) getOrCreate(id [proto.SessionIDLen]byte, udpDst *net.UDPAddr, sender *sendpool.Pool) (*clientSession, bool) {
-	sm.mu.RLock()
-	if sess, ok := sm.sessions[id]; ok {
-		sm.mu.RUnlock()
-		sess.udpDst = udpDst // آپدیت IP در صورت تغییر
-		return sess, false    // موجود بود
+	if v, ok := sm.sessions.Load(id); ok {
+		sess := v.(*clientSession)
+		sess.udpDst = udpDst
+		return sess, false
 	}
-	sm.mu.RUnlock()
 
 	// جدید
 	if !sm.limit.Acquire() {
 		return nil, false
 	}
-	sess := &clientSession{
-		id:     id,
-		udpDst: udpDst,
-		sender: sender,
-	}
-	sm.mu.Lock()
-	// double-check
-	if existing, ok := sm.sessions[id]; ok {
-		sm.mu.Unlock()
+	sess := &clientSession{id: id, udpDst: udpDst, sender: sender}
+	if actual, loaded := sm.sessions.LoadOrStore(id, sess); loaded {
 		sm.limit.Release()
-		existing.udpDst = udpDst
-		return existing, false
+		actual.(*clientSession).udpDst = udpDst
+		return actual.(*clientSession), false
 	}
-	sm.sessions[id] = sess
-	sm.mu.Unlock()
 	M.ActiveClients.Add(1)
 	M.TotalConnections.Add(1)
 	return sess, true
 }
 
 func (sm *sessionManager) remove(id [proto.SessionIDLen]byte) {
-	sm.mu.Lock()
-	_, ok := sm.sessions[id]
-	if ok {
-		delete(sm.sessions, id)
-	}
-	sm.mu.Unlock()
-	if ok {
+	if _, ok := sm.sessions.LoadAndDelete(id); ok {
 		sm.limit.Release()
 		M.ActiveClients.Add(-1)
 	}
@@ -127,7 +138,7 @@ type tcpJob struct {
 }
 
 func newTCPWriter(conn net.Conn) *tcpWriter {
-	w := &tcpWriter{ch: make(chan tcpJob, 128), done: make(chan struct{})}
+	w := &tcpWriter{ch: make(chan tcpJob, 512), done: make(chan struct{})}
 	go w.loop(conn)
 	return w
 }
@@ -141,12 +152,16 @@ func (w *tcpWriter) loop(conn net.Conn) {
 		proto.EncodeTCPHdr(hdr, job.streamID, job.msgType, len(job.payload))
 		err := cw.Write(hdr, job.payload)
 		if job.errCh != nil {
-			if err == nil { err = cw.Flush() }
+			if err == nil {
+				err = cw.Flush()
+			}
 			job.errCh <- err
 		}
 		if err != nil {
 			for job := range w.ch {
-				if job.errCh != nil { job.errCh <- io.ErrClosedPipe }
+				if job.errCh != nil {
+					job.errCh <- io.ErrClosedPipe
+				}
 			}
 			return
 		}
@@ -155,14 +170,18 @@ func (w *tcpWriter) loop(conn net.Conn) {
 
 func (w *tcpWriter) write(sid uint32, mt byte, payload []byte, sync bool) error {
 	var errCh chan error
-	if sync { errCh = make(chan error, 1) }
+	if sync {
+		errCh = make(chan error, 1)
+	}
 	job := tcpJob{streamID: sid, msgType: mt, payload: payload, errCh: errCh}
 	select {
 	case w.ch <- job:
 	case <-w.done:
 		return io.ErrClosedPipe
 	default:
-		if !sync { return nil }
+		if !sync {
+			return nil
+		}
 		select {
 		case w.ch <- job:
 		case <-w.done:
@@ -171,8 +190,10 @@ func (w *tcpWriter) write(sid uint32, mt byte, payload []byte, sync bool) error 
 	}
 	if sync {
 		select {
-		case err := <-errCh: return err
-		case <-w.done: return io.ErrClosedPipe
+		case err := <-errCh:
+			return err
+		case <-w.done:
+			return io.ErrClosedPipe
 		}
 	}
 	return nil
@@ -189,6 +210,8 @@ func handleTCP(
 	sender *sendpool.Pool,
 	tcpDial func(string) (net.Conn, error),
 	flowLimit int64,
+	maxPayload int,
+	autoFrag bool,
 	log *slog.Logger,
 ) {
 	defer conn.Close()
@@ -223,9 +246,9 @@ func handleTCP(
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(10 * time.Second)
-		tc.SetReadBuffer(32 * 1024)
-		tc.SetWriteBuffer(32 * 1024)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(128 * 1024)
+		tc.SetWriteBuffer(128 * 1024)
 	}
 
 	writer := newTCPWriter(conn)
@@ -257,7 +280,9 @@ func handleTCP(
 	if tc, ok := dstConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetReadBuffer(512 * 1024)
+		tc.SetKeepAlivePeriod(60 * time.Second)
+		tc.SetReadBuffer(256 * 1024)
+		tc.SetWriteBuffer(64 * 1024)
 	}
 	defer dstConn.Close()
 
@@ -277,27 +302,51 @@ func handleTCP(
 	var dlSeq atomic.Uint32
 	go func() {
 		defer close(dlDone)
-		rbuf := make([]byte, proto.MaxPayload)
+		// از pool برای read buffer — کاهش allocation
+		rbufPtr := rbufPool.Get().(*[]byte)
+		rbuf := *rbufPtr
+		// cap را به maxPayload محدود کن — جلوگیری از fragment بیش از حد
+		if len(rbuf) > maxPayload {
+			rbuf = rbuf[:maxPayload]
+		}
+		defer rbufPool.Put(rbufPtr)
+
+		dstConn.SetDeadline(time.Now().Add(idleDur))
 		for {
-			dstConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 			n, err := dstConn.Read(rbuf)
 			if n > 0 {
-				if !flow.Acquire(n, 8*time.Second) { return }
-				seq := dlSeq.Add(1)
-				flags := byte(0)
-				if err != nil { flags = proto.FlagLast }
-				frame := make([]byte, proto.UDPHdrSize+n)
-				proto.EncodeUDP(frame, streamID, seq, flags, rbuf[:n])
-				sess.sender.Send(sendpool.Packet{
-					StreamID: streamID,
-					Data:     frame,
-					Dst:      sess.udpDst,
-				})
+				if !flow.Acquire(n, 8*time.Second) {
+					return
+				}
+
+				// MTU fragment
+				chunks := [][]byte{rbuf[:n]}
+				if autoFrag && n > maxPayload {
+					chunks = mtu.Fragment(rbuf[:n], maxPayload)
+				}
+				for i, chunk := range chunks {
+					seq := dlSeq.Add(1)
+					flags := byte(0)
+					if i == len(chunks)-1 && err != nil {
+						flags = proto.FlagLast
+					}
+					// encode مستقیم — یه alloc، بدون pool overhead
+					fsize := proto.UDPHdrSize + len(chunk)
+					data := make([]byte, fsize)
+					proto.EncodeUDP(data, streamID, seq, flags, chunk)
+					sess.sender.Send(sendpool.Packet{
+						StreamID: streamID,
+						Data:     data,
+						Dst:      sess.udpDst,
+					})
+				}
 				M.DownloadBytes.Add(uint64(n))
 				M.DownloadPackets.Add(1)
 			}
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() { continue }
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
 				return
 			}
 		}
@@ -306,7 +355,9 @@ func handleTCP(
 	// آپلود: TCP پیام‌ها بخون
 	for {
 		f, err := proto.ReadTCPFrame(conn)
-		if err != nil { break }
+		if err != nil {
+			break
+		}
 
 		switch f.Type {
 		case proto.MsgData:
@@ -349,38 +400,46 @@ done:
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
-	cfgFile    := flag.String("config", "", "مسیر فایل config")
-	genConfig  := flag.Bool("gen-config", false, "ساخت config نمونه")
-	genKey     := flag.Bool("gen-key", false, "ساخت کلید obfs تصادفی")
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	tcpListen     := flag.String("listen-addr", "", "آدرس TCP listen")
-	udpSrcPort    := flag.Int("download-src-port", 0, "پورت UDP ارسال دانلود")
+	cfgFile := flag.String("config", "", "مسیر فایل config")
+	genConfig := flag.Bool("gen-config", false, "ساخت config نمونه")
+	genKey := flag.Bool("gen-key", false, "ساخت کلید obfs تصادفی")
+
+	tcpListen := flag.String("listen-addr", "", "آدرس TCP listen")
+	udpSrcPort := flag.Int("download-src-port", 0, "پورت UDP ارسال دانلود")
 	transportMode := flag.String("transport", "", "udp یا obfs")
-	obfsKey       := flag.String("obfs-key", "", "کلید obfs")
-	spoofIP       := flag.String("spoof-ip", "", "IP جعلی برای UDP")
-	spoofIface    := flag.String("spoof-interface", "", "interface برای spoof")
-	spoofGW       := flag.String("spoof-gateway", "", "gateway برای spoof")
-	bindSrc       := flag.String("outbound-bind-ip", "", "IP مبدا TCP خروجی")
-	maxClients    := flag.Int("max-clients", 0, "حداکثر کلاینت")
-	flowLimit     := flag.Int64("flow-window-bytes", 0, "پنجره flow control")
-	sendWorkers   := flag.Int("udp-workers", 0, "تعداد worker UDP")
-	dialTimeoutS  := flag.Int("dial-timeout-sec", 0, "timeout اتصال به مقصد")
-	metricsAddr   := flag.String("metrics-addr", "", "آدرس metrics")
-	verbose       := flag.Bool("v", false, "verbose")
+	obfsKey := flag.String("obfs-key", "", "کلید obfs")
+	spoofIP := flag.String("spoof-ip", "", "IP جعلی برای UDP")
+	spoofIface := flag.String("spoof-interface", "", "interface برای spoof")
+	spoofGW := flag.String("spoof-gateway", "", "gateway برای spoof")
+	bindSrc := flag.String("outbound-bind-ip", "", "IP مبدا TCP خروجی")
+	maxClients := flag.Int("max-clients", 0, "حداکثر کلاینت")
+	flowLimit := flag.Int64("flow-window-bytes", 0, "پنجره flow control")
+	sendWorkers := flag.Int("udp-workers", 0, "تعداد worker UDP")
+	dialTimeoutS := flag.Int("dial-timeout-sec", 0, "timeout اتصال به مقصد")
+	metricsAddr := flag.String("metrics-addr", "", "آدرس metrics")
+	dashboardAddr := flag.String("dashboard-addr", "", "آدرس dashboard (مثلاً 0.0.0.0:8080)")
+	dashboardKey := flag.String("dashboard-key", "", "کلید ورود به dashboard")
+	verbose := flag.Bool("v", false, "verbose")
 	flag.Parse()
 
 	if *genKey {
 		key := make([]byte, 32)
-		if _, err := os.ReadFile("/dev/urandom"); err == nil {}
-		for i := range key { key[i] = byte(i*7+13) }
-		net.Dial("", "") // just to use net
+		if _, err := io.ReadFull(cryptoRand.Reader, key); err != nil {
+			fmt.Fprintln(os.Stderr, "gen key:", err)
+			os.Exit(1)
+		}
 		fmt.Printf("🔑 %x\n", key)
+		fmt.Printf("  \"obfs_key\": \"%x\"\n", key)
 		os.Exit(0)
 	}
 
 	if *genConfig {
 		path := "server.json"
-		if *cfgFile != "" { path = *cfgFile }
+		if *cfgFile != "" {
+			path = *cfgFile
+		}
 		cfgpkg.SaveServerExample(path)
 		fmt.Printf("✅ %s ساخته شد\n./server --config %s\n", path, path)
 		os.Exit(0)
@@ -410,6 +469,8 @@ func main() {
 	cfgpkg.ApplyInt(&cfg.UDPWorkers, *sendWorkers, d.UDPWorkers)
 	cfgpkg.ApplyInt(&cfg.DialTimeoutSec, *dialTimeoutS, d.DialTimeoutSec)
 	cfgpkg.ApplyString(&cfg.MetricsAddr, *metricsAddr, d.MetricsAddr)
+	cfgpkg.ApplyString(&cfg.DashboardAddr, *dashboardAddr, d.DashboardAddr)
+	cfgpkg.ApplyString(&cfg.DashboardKey, *dashboardKey, d.DashboardKey)
 	cfgpkg.ApplyBool(&cfg.Verbose, *verbose)
 
 	log := makeLogger(cfg.Verbose)
@@ -424,8 +485,63 @@ func main() {
 
 	dialTimeout := time.Duration(cfg.DialTimeoutSec) * time.Second
 
-	// TCP dialer
-	tcpDial := makeTCPDialer(cfg.OutboundBindIP, dialTimeout)
+	// ── DNS resolver با cache ────────────────────────────────────────────────
+	dnsResolver := dnscache.New(dnscache.Config{
+		Enable:      cfg.DNS.Enable,
+		Mode:        cfg.DNS.Mode,
+		Nameserver:  cfg.DNS.Nameserver,
+		DoHURL:      cfg.DNS.DoHURL,
+		TTL:         cfg.DNS.TTLSec,
+		NegativeTTL: cfg.DNS.NegTTLSec,
+		MaxEntries:  cfg.DNS.MaxEntries,
+	})
+	log.Info("🌐 DNS",
+		"mode", cfg.DNS.Mode,
+		"server", cfg.DNS.Nameserver,
+		"ttl", cfg.DNS.TTLSec,
+		"cache", cfg.DNS.Enable,
+	)
+
+	// ── MTU ─────────────────────────────────────────────────────────────────
+	isObfsMode := cfg.TransportMode == "obfs"
+	maxPayload := mtu.MaxPayload(cfg.MTU.MTU, isObfsMode)
+	log.Info("📦 MTU",
+		"mtu", cfg.MTU.MTU,
+		"max_payload", maxPayload,
+		"auto_fragment", cfg.MTU.AutoFragment,
+	)
+
+	// TCP dialer با DNS cache
+	tcpDial := makeTCPDialerWithDNS(cfg.OutboundBindIP, dialTimeout, dnsResolver)
+
+	// ── Dashboard ─────────────────────────────────────────────────────────────
+	if cfg.DashboardAddr != "" {
+		key := cfg.DashboardKey
+		if key == "" || key == "changeme" {
+			key = "admin"
+			log.Warn("⚠ dashboard_key تنظیم نشده — حتماً در server.json عوضش کن!")
+		}
+		dash := dashboard.New(cfg.DashboardAddr, key, *cfgFile, func() dashboard.Stats {
+			s := M.Snapshot()
+			return dashboard.Stats{
+				ActiveStreams:   s.ActiveStreams,
+				ActiveClients:   s.ActiveClients,
+				TotalStreams:    s.TotalStreams,
+				UploadMB:        float64(s.UploadBytes) / 1e6,
+				DownloadMB:      float64(s.DownloadBytes) / 1e6,
+				UploadSpeedKB:   float64(s.UploadBytes) / 1e3,
+				DownloadSpeedKB: float64(s.DownloadBytes) / 1e3,
+				Reconnects:      s.Reconnects,
+				DialErrors:      s.DialErrors,
+			}
+		}, dnsResolver.Flush)
+		go func() {
+			log.Info("🖥  dashboard", "addr", "http://"+cfg.DashboardAddr)
+			if err := dash.Start(); err != nil {
+				log.Warn("dashboard", "err", err)
+			}
+		}()
+	}
 
 	// ── Transport ────────────────────────────────────────────────────────────
 	var resolvedGW, resolvedIface string
@@ -447,7 +563,9 @@ func main() {
 				// نمایش interface‌های موجود
 				ifaces, _ := net.Interfaces()
 				for _, i := range ifaces {
-					if i.Flags&net.FlagLoopback != 0 { continue }
+					if i.Flags&net.FlagLoopback != 0 {
+						continue
+					}
 					log.Info("🔌 interface", "name", i.Name)
 				}
 				os.Exit(1)
@@ -468,11 +586,17 @@ func main() {
 			tr, err = transport.NewObfsSpoof(cfg.DownloadSrcPort, key,
 				resolvedIface, net.ParseIP(resolvedGW),
 				net.ParseIP(cfg.SpoofIP).To4(), uint16(cfg.DownloadSrcPort))
-			if err != nil { log.Error("obfs+spoof", "err", err); os.Exit(1) }
+			if err != nil {
+				log.Error("obfs+spoof", "err", err)
+				os.Exit(1)
+			}
 			log.Warn("⚡ obfs+spoof", "spoof_ip", cfg.SpoofIP)
 		} else {
 			tr, err = transport.NewObfs(cfg.DownloadSrcPort, key)
-			if err != nil { log.Error("obfs", "err", err); os.Exit(1) }
+			if err != nil {
+				log.Error("obfs", "err", err)
+				os.Exit(1)
+			}
 			log.Info("⚡ obfs", "port", cfg.DownloadSrcPort)
 		}
 	default:
@@ -481,12 +605,18 @@ func main() {
 			tr, err = transport.NewUDPWithSpoof(cfg.DownloadSrcPort,
 				resolvedIface, net.ParseIP(resolvedGW),
 				net.ParseIP(cfg.SpoofIP).To4(), uint16(cfg.DownloadSrcPort))
-			if err != nil { log.Error("udp+spoof", "err", err); os.Exit(1) }
+			if err != nil {
+				log.Error("udp+spoof", "err", err)
+				os.Exit(1)
+			}
 			log.Warn("⚡ UDP+spoof", "spoof_ip", cfg.SpoofIP)
 		} else {
 			var err error
 			tr, err = transport.NewUDP(cfg.DownloadSrcPort)
-			if err != nil { log.Error("UDP", "err", err); os.Exit(1) }
+			if err != nil {
+				log.Error("UDP", "err", err)
+				os.Exit(1)
+			}
 			log.Info("⚡ UDP", "port", cfg.DownloadSrcPort)
 		}
 	}
@@ -494,7 +624,9 @@ func main() {
 
 	// ── Send pool ────────────────────────────────────────────────────────────
 	workers := cfg.UDPWorkers
-	if workers <= 0 { workers = runtime.NumCPU() }
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
 	sender, err := sendpool.New(sendpool.Config{
 		Workers:   workers,
 		QueueSize: 8192,
@@ -510,7 +642,15 @@ func main() {
 	sm := newSessionManager(cfg.MaxClients)
 
 	// ── TCP listener ─────────────────────────────────────────────────────────
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// SO_REUSEADDR — سریع restart بدون wait
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
+		},
+	}
+	ln, err := lc.Listen(context.Background(), "tcp", cfg.ListenAddr)
 	if err != nil {
 		log.Error("TCP listen", "err", err)
 		os.Exit(1)
@@ -531,13 +671,53 @@ func main() {
 	go func() { <-ctx.Done(); ln.Close() }()
 	go statsLogger(ctx, log)
 
+	// semaphore برای محدود کردن goroutine های همزمان
+	// هر goroutine ~64KB stack → 100K goroutine = 6.4GB
+	sem := make(chan struct{}, cfg.MaxClients*2)
+	if cap(sem) < 1000 {
+		sem = make(chan struct{}, 1000)
+	}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil { break }
+			if ctx.Err() != nil {
+				break
+			}
+			// temporary error — retry
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
 			continue
 		}
-		go handleTCP(ctx, conn, sm, sender, tcpDial, cfg.FlowWindowBytes, log)
+		// سعی کن با timeout کوتاه accept کن — نه reject فوری
+		accepted := false
+		select {
+		case sem <- struct{}{}:
+			accepted = true
+		default:
+			select {
+			case sem <- struct{}{}:
+				accepted = true
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if !accepted {
+			conn.Close()
+			M.RejectedConns.Add(1)
+			log.Warn("⚠ connection rejected — max clients reached")
+			continue
+		}
+		go func(c net.Conn) {
+			defer func() {
+				<-sem
+				if r := recover(); r != nil {
+					log.Error("panic در handleTCP", "err", r)
+				}
+			}()
+			handleTCP(ctx, c, sm, sender, tcpDial, cfg.FlowWindowBytes, maxPayload, cfg.MTU.AutoFragment, log)
+		}(conn)
 	}
 	log.Info("سرور خاموش شد")
 }
@@ -545,7 +725,9 @@ func main() {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func makeTCPDialer(bindSrc string, timeout time.Duration) func(string) (net.Conn, error) {
-	if timeout <= 0 { timeout = 10 * time.Second }
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	d := &net.Dialer{Timeout: timeout}
 	if bindSrc != "" {
 		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(bindSrc)}
@@ -555,13 +737,73 @@ func makeTCPDialer(bindSrc string, timeout time.Duration) func(string) (net.Conn
 	}
 }
 
+// makeTCPDialerWithDNS: dial با DNS cache
+func makeTCPDialerWithDNS(bindSrc string, timeout time.Duration, dns *dnscache.Resolver) func(string) (net.Conn, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return func(addr string) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if bindSrc != "" {
+			d := &net.Dialer{
+				Timeout:   timeout,
+				LocalAddr: &net.TCPAddr{IP: net.ParseIP(bindSrc)},
+			}
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := dns.LookupHost(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			// concurrent dial — سریع‌ترین IP که وصل بشه
+			type result struct {
+				conn net.Conn
+				err  error
+			}
+			ch := make(chan result, len(ips))
+			for _, ip := range ips {
+				go func(ip net.IP) {
+					conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
+					ch <- result{conn, err}
+				}(ip)
+			}
+			var firstConn net.Conn
+			var lastErr error
+			for range ips {
+				r := <-ch
+				if r.err == nil && firstConn == nil {
+					firstConn = r.conn
+				} else if r.conn != nil {
+					r.conn.Close() // بقیه رو ببند
+				} else {
+					lastErr = r.err
+				}
+			}
+			if firstConn != nil {
+				return firstConn, nil
+			}
+			return nil, fmt.Errorf("dial %s: %w", addr, lastErr)
+		}
+		return dns.Dial(ctx, "tcp", addr)
+	}
+}
+
 func parseObfsKey(hexKey string) ([]byte, error) {
-	if hexKey == "" { return nil, fmt.Errorf("obfs-key خالی") }
-	if len(hexKey) != 64 { return nil, fmt.Errorf("obfs-key باید 64 کاراکتر باشه") }
+	if hexKey == "" {
+		return nil, fmt.Errorf("obfs-key خالی")
+	}
+	if len(hexKey) != 64 {
+		return nil, fmt.Errorf("obfs-key باید 64 کاراکتر باشه")
+	}
 	key := make([]byte, 32)
 	for i := 0; i < 32; i++ {
 		b, err := strconv.ParseUint(hexKey[i*2:i*2+2], 16, 8)
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		key[i] = byte(b)
 	}
 	return key, nil
@@ -572,7 +814,8 @@ func statsLogger(ctx context.Context, log *slog.Logger) {
 	defer tick.Stop()
 	for {
 		select {
-		case <-ctx.Done(): return
+		case <-ctx.Done():
+			return
 		case <-tick.C:
 			s := M.Snapshot()
 			log.Info("📊", "clients", s.ActiveClients, "streams", s.ActiveStreams,
@@ -583,12 +826,16 @@ func statsLogger(ctx context.Context, log *slog.Logger) {
 
 func makeLogger(v bool) *slog.Logger {
 	lvl := slog.LevelInfo
-	if v { lvl = slog.LevelDebug }
+	if v {
+		lvl = slog.LevelDebug
+	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 }
 
 func isTimeout(err error) bool {
-	if err == nil { return false }
+	if err == nil {
+		return false
+	}
 	ne, ok := err.(net.Error)
 	return ok && ne.Timeout()
 }

@@ -1,4 +1,4 @@
-// sttunnel client
+// Qs-Tunnel client
 //
 // معماری: هر stream → TCP connection مستقل
 //   - قطع یه proxy فقط اون stream رو تحت تأثیر میذاره
@@ -24,18 +24,33 @@ import (
 	"syscall"
 	"time"
 
-	cfgpkg "github.com/sttunnel/internal/config"
-	"github.com/sttunnel/internal/metrics"
-	"github.com/sttunnel/internal/proto"
-	"github.com/sttunnel/internal/reasm"
-	"github.com/sttunnel/internal/socks5"
-	"github.com/sttunnel/internal/transport"
+	"runtime"
+
+	cfgpkg "github.com/Qteam-official/QS-Tunnel/internal/config"
+	"github.com/Qteam-official/QS-Tunnel/internal/dashboard"
+	"github.com/Qteam-official/QS-Tunnel/internal/metrics"
+	"github.com/Qteam-official/QS-Tunnel/internal/proto"
+	"github.com/Qteam-official/QS-Tunnel/internal/reasm"
+	"github.com/Qteam-official/QS-Tunnel/internal/socks5"
+	"github.com/Qteam-official/QS-Tunnel/internal/transport"
+	"github.com/Qteam-official/QS-Tunnel/internal/xui"
 )
 
-var M = metrics.New()
+var (
+	M = metrics.New()
+
+	// udpPayloadPool: بازاستفاده از payload buffer برای UDP پکت‌های دریافتی
+	// کاهش GC pressure در ترافیک بالا
+	udpPayloadPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 1500)
+			return &b
+		},
+	}
+)
 
 const (
-	flowAckUnit  = 16 * 1024
+	flowAckUnit  = 64 * 1024
 	maxReconnect = 8
 )
 
@@ -57,9 +72,10 @@ type stream struct {
 	reasmMgr    *reasm.Manager
 
 	// TCP connection این stream
-	mu     sync.Mutex
-	conn   net.Conn
-	writer *tcpWriter
+	mu          sync.Mutex
+	conn        net.Conn
+	writer      *tcpWriter
+	reconnectCh chan struct{} // signal: reconnect انجام شد
 
 	// reassembler (دانلود)
 	rx atomic.Pointer[reasm.Reassembler]
@@ -90,6 +106,7 @@ func newStream(
 		udpAddr: udpAddr, reasmMgr: reasmMgr,
 		ctx: ctx, cancel: cancel, log: log,
 	}
+	s.reconnectCh = make(chan struct{}, 1)
 	s.rx.Store(reasm.New(1))
 	return s
 }
@@ -103,9 +120,9 @@ func (s *stream) dial() error {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(10 * time.Second)
-		tc.SetReadBuffer(32 * 1024)
-		tc.SetWriteBuffer(32 * 1024)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(128 * 1024)
+		tc.SetWriteBuffer(128 * 1024)
 	}
 
 	w := newTCPWriter(conn)
@@ -113,7 +130,8 @@ func (s *stream) dial() error {
 	// Hello
 	helloPayload := proto.EncodeHello(globalSessionID, s.udpAddr.IP, uint16(s.udpAddr.Port))
 	if err := w.write(0, proto.MsgHello, helloPayload, true); err != nil {
-		w.close(); conn.Close()
+		w.close()
+		conn.Close()
 		return fmt.Errorf("hello: %w", err)
 	}
 
@@ -124,12 +142,17 @@ func (s *stream) dial() error {
 		defer close(ackDone)
 		for {
 			f, err := proto.ReadTCPFrame(conn)
-			if err != nil { errCh <- err; return }
+			if err != nil {
+				errCh <- err
+				return
+			}
 			switch f.Type {
 			case proto.MsgConnAck:
-				errCh <- nil; return
+				errCh <- nil
+				return
 			case proto.MsgConnErr:
-				errCh <- errors.New("connect rejected"); return
+				errCh <- errors.New("connect rejected")
+				return
 			case proto.MsgPing:
 				w.write(0, proto.MsgPong, nil, false)
 			}
@@ -141,18 +164,25 @@ func (s *stream) dial() error {
 			AddrType: s.addrType, Addr: s.addr, Port: s.port,
 		}), false,
 	); err != nil {
-		w.close(); conn.Close()
+		w.close()
+		conn.Close()
 		return fmt.Errorf("connect write: %w", err)
 	}
 
 	select {
 	case err := <-errCh:
-		if err != nil { w.close(); conn.Close(); return err }
+		if err != nil {
+			w.close()
+			conn.Close()
+			return err
+		}
 	case <-time.After(15 * time.Second):
-		w.close(); conn.Close()
+		w.close()
+		conn.Close()
 		return errors.New("connack timeout")
 	case <-s.ctx.Done():
-		w.close(); conn.Close()
+		w.close()
+		conn.Close()
 		return s.ctx.Err()
 	}
 
@@ -224,6 +254,11 @@ func (s *stream) reconnect() {
 		if err := s.dial(); err == nil {
 			s.log.Info("✅ reconnect OK", "sid", s.id)
 			M.Reconnects.Add(1)
+			// signal به Write که reconnect شد
+			select {
+			case s.reconnectCh <- struct{}{}:
+			default:
+			}
 			return
 		}
 		backoff = minDur(backoff*2, 20*time.Second)
@@ -248,23 +283,28 @@ func (s *stream) Write(p []byte) (int, error) {
 		s.mu.Unlock()
 
 		if w == nil {
-			// TCP در حال reconnect — کوتاه صبر کن
+			// TCP در حال reconnect — با sleep ساده (کم‌هزینه)
 			select {
 			case <-s.ctx.Done():
 				return 0, io.ErrClosedPipe
-			case <-time.After(200 * time.Millisecond):
+			case <-s.reconnectCh:
+				// reconnect شد — retry بلافاصله
 				continue
+			case <-time.After(100 * time.Millisecond):
 			}
+			continue
 		}
 
 		if err := w.write(s.id, proto.MsgData, p, false); err != nil {
-			// TCP قطع شد — reconnect در جریانه
+			// write fail — منتظر reconnect بمون
 			select {
 			case <-s.ctx.Done():
 				return 0, io.ErrClosedPipe
-			case <-time.After(200 * time.Millisecond):
+			case <-s.reconnectCh:
 				continue
+			case <-time.After(50 * time.Millisecond):
 			}
+			continue
 		}
 
 		M.UploadBytes.Add(uint64(len(p)))
@@ -284,11 +324,7 @@ func (s *stream) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		case data, ok := <-rx.Chan():
 			if !ok {
-				if s.closed.Load() {
-					return 0, io.EOF
-				}
-				time.Sleep(20 * time.Millisecond)
-				continue
+				return 0, io.EOF
 			}
 			n := copy(p, data)
 			unacked := s.bytesUnacked.Add(int64(n))
@@ -341,42 +377,58 @@ func (s *stream) Close() error {
 	return nil
 }
 
-// ─── streamMux ───────────────────────────────────────────────────────────────
+// ─── streamMux — sharded برای concurrency بالا ───────────────────────────────
+// به جای یه lock بزرگ، 256 shard داریم
+// هر stream بر اساس id به یه shard میره → contention کم
+
+const numShards = 256
+
+type shard struct {
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+}
 
 type streamMux struct {
-	mu       sync.RWMutex
-	streams  map[uint32]*stream
+	shards   [numShards]shard
 	reasmMgr *reasm.Manager
 	nextID   atomic.Uint32
 }
 
 func newMux() *streamMux {
-	return &streamMux{
-		streams:  make(map[uint32]*stream),
-		reasmMgr: reasm.NewManager(),
+	m := &streamMux{reasmMgr: reasm.NewManager()}
+	for i := range m.shards {
+		m.shards[i].streams = make(map[uint32]*stream, 16)
 	}
+	return m
+}
+
+func (m *streamMux) shardOf(id uint32) *shard {
+	return &m.shards[id%numShards]
 }
 
 func (m *streamMux) add(s *stream) {
-	m.mu.Lock()
-	m.streams[s.id] = s
-	m.mu.Unlock()
+	sh := m.shardOf(s.id)
+	sh.mu.Lock()
+	sh.streams[s.id] = s
+	sh.mu.Unlock()
 }
 
 func (m *streamMux) get(id uint32) (*stream, bool) {
-	m.mu.RLock()
-	s, ok := m.streams[id]
-	m.mu.RUnlock()
+	sh := m.shardOf(id)
+	sh.mu.RLock()
+	s, ok := sh.streams[id]
+	sh.mu.RUnlock()
 	return s, ok
 }
 
 func (m *streamMux) remove(id uint32) {
-	m.mu.Lock()
-	_, ok := m.streams[id]
+	sh := m.shardOf(id)
+	sh.mu.Lock()
+	_, ok := sh.streams[id]
 	if ok {
-		delete(m.streams, id)
+		delete(sh.streams, id)
 	}
-	m.mu.Unlock()
+	sh.mu.Unlock()
 	if ok {
 		m.reasmMgr.Unregister(id)
 		M.ActiveStreams.Add(-1)
@@ -384,11 +436,16 @@ func (m *streamMux) remove(id uint32) {
 }
 
 func (m *streamMux) closeAll() {
-	m.mu.Lock()
-	streams := m.streams
-	m.streams = make(map[uint32]*stream)
-	m.mu.Unlock()
-	for _, s := range streams {
+	var all []*stream
+	for i := range m.shards {
+		m.shards[i].mu.Lock()
+		for _, s := range m.shards[i].streams {
+			all = append(all, s)
+		}
+		m.shards[i].streams = make(map[uint32]*stream, 16)
+		m.shards[i].mu.Unlock()
+	}
+	for _, s := range all {
 		s.Close()
 	}
 }
@@ -411,7 +468,7 @@ type tcpJob struct {
 }
 
 func newTCPWriter(conn net.Conn) *tcpWriter {
-	w := &tcpWriter{ch: make(chan tcpJob, 128), done: make(chan struct{})}
+	w := &tcpWriter{ch: make(chan tcpJob, 512), done: make(chan struct{})}
 	go w.loop(conn)
 	return w
 }
@@ -481,21 +538,51 @@ func (w *tcpWriter) close() {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-func main() {
-	cfgFile   := flag.String("config", "", "مسیر فایل config")
-	genConfig := flag.Bool("gen-config", false, "ساخت config نمونه")
-	genKey    := flag.Bool("gen-key", false, "ساخت کلید obfs")
+func runXUISetup(url, user, pass string, port int) {
+	cfg := xui.Config{
+		PanelURL:    url,
+		Username:    user,
+		Password:    pass,
+		InboundPort: port,
+		InboundTag:  "qs-upload",
+	}
+	client := xui.New(cfg)
+	if err := client.Setup(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ خطا: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\n✅ تنظیم 3x-ui کامل شد\n")
+	fmt.Printf("   Upload proxy: socks5://127.0.0.1:%d\n", port)
+	fmt.Printf("   در client.json بذار: \"upload_proxy\": \"127.0.0.1:%d\"\n", port)
+}
 
-	fServer    := flag.String("server", "", "آدرس سرور")
-	fUpProxy   := flag.String("upload-proxy", "", "SOCKS5 آپلود")
-	fSocks     := flag.String("local-socks", "", "SOCKS5 listener")
-	fDLPort    := flag.Int("download-port", 0, "پورت UDP دانلود")
-	fMyIP      := flag.String("my-public-ip", "", "IP عمومی")
+func main() {
+	// همه CPU core استفاده بشه
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	cfgFile := flag.String("config", "", "مسیر فایل config")
+	genConfig := flag.Bool("gen-config", false, "ساخت config نمونه")
+	genKey := flag.Bool("gen-key", false, "ساخت کلید obfs")
+
+	fServer := flag.String("server", "", "آدرس سرور")
+	fUpProxy := flag.String("upload-proxy", "", "SOCKS5 آپلود")
+	fSocks := flag.String("local-socks", "", "SOCKS5 listener")
+	fDLPort := flag.Int("download-port", 0, "پورت UDP دانلود")
+	fMyIP := flag.String("my-public-ip", "", "IP عمومی")
 	fTransport := flag.String("transport", "", "udp یا obfs")
-	fObfsKey   := flag.String("obfs-key", "", "کلید obfs")
-	fMaxConn   := flag.Int("max-connections", 0, "حداکثر اتصال")
-	fMetrics   := flag.String("metrics-addr", "", "آدرس metrics")
-	fVerbose   := flag.Bool("v", false, "verbose")
+	fObfsKey := flag.String("obfs-key", "", "کلید obfs")
+	fMaxConn := flag.Int("max-connections", 0, "حداکثر اتصال")
+	fMetrics := flag.String("metrics-addr", "", "آدرس metrics")
+	fDashboardAddr := flag.String("dashboard-addr", "", "آدرس dashboard")
+	fDashboardKey := flag.String("dashboard-key", "", "کلید ورود dashboard")
+	fVerbose := flag.Bool("v", false, "verbose")
+
+	// 3x-ui integration
+	xuiSetup := flag.Bool("xui-setup", false, "اتصال و تنظیم خودکار 3x-ui")
+	xuiURL := flag.String("xui-url", "http://127.0.0.1:2053", "آدرس پنل 3x-ui")
+	xuiUser := flag.String("xui-user", "admin", "نام کاربری 3x-ui")
+	xuiPass := flag.String("xui-pass", "admin", "رمز 3x-ui")
+	xuiPort := flag.Int("xui-port", 1111, "پورت inbound SOCKS5 در 3x-ui")
 	flag.Parse()
 
 	if *genKey {
@@ -513,6 +600,12 @@ func main() {
 		}
 		cfgpkg.SaveClientExample(path)
 		fmt.Printf("✅ %s ساخته شد\n./client --config %s\n", path, path)
+		os.Exit(0)
+	}
+
+	// 3x-ui setup
+	if *xuiSetup {
+		runXUISetup(*xuiURL, *xuiUser, *xuiPass, *xuiPort)
 		os.Exit(0)
 	}
 
@@ -536,6 +629,8 @@ func main() {
 	cfgpkg.ApplyString(&cfg.ObfsKey, *fObfsKey, d.ObfsKey)
 	cfgpkg.ApplyInt(&cfg.MaxStreams, *fMaxConn, d.MaxStreams)
 	cfgpkg.ApplyString(&cfg.MetricsAddr, *fMetrics, d.MetricsAddr)
+	cfgpkg.ApplyString(&cfg.DashboardAddr, *fDashboardAddr, d.DashboardAddr)
+	cfgpkg.ApplyString(&cfg.DashboardKey, *fDashboardKey, d.DashboardKey)
 	cfgpkg.ApplyBool(&cfg.Verbose, *fVerbose)
 
 	if cfg.ServerAddr == "" {
@@ -553,27 +648,60 @@ func main() {
 
 	go func() { M.StartHTTPServer(cfg.MetricsAddr) }()
 
+	// ── Dashboard ─────────────────────────────────────────────────────────────
+	if cfg.DashboardAddr != "" {
+		key := cfg.DashboardKey
+		if key == "" || key == "changeme" {
+			key = "admin"
+			log.Warn("⚠ dashboard_key تنظیم نشده — پیش‌فرض 'admin' استفاده میشه")
+		}
+		cfgPath := ""
+		if *cfgFile != "" {
+			cfgPath = *cfgFile
+		}
+		dash := dashboard.New(cfg.DashboardAddr, key, cfgPath, func() dashboard.Stats {
+			s := M.Snapshot()
+			return dashboard.Stats{
+				ActiveStreams:   s.ActiveStreams,
+				TotalStreams:    s.TotalStreams,
+				UploadMB:        float64(s.UploadBytes) / 1e6,
+				DownloadMB:      float64(s.DownloadBytes) / 1e6,
+				UploadSpeedKB:   float64(s.UploadBytes) / 1e3,
+				DownloadSpeedKB: float64(s.DownloadBytes) / 1e3,
+				Reconnects:      s.Reconnects,
+			}
+		}, nil)
+		go func() {
+			log.Info("🖥  dashboard", "addr", "http://"+cfg.DashboardAddr)
+			if err := dash.Start(); err != nil {
+				log.Warn("dashboard", "err", err)
+			}
+		}()
+	}
+
 	// sessionID مشترک
 	cryptoRand.Read(globalSessionID[:])
 
-	// IP عمومی
+	// IP عمومی — بدون نیاز به اینترنت بین‌الملل
 	var realIP net.IP
 	if cfg.MyPublicIP != "" {
 		realIP = net.ParseIP(cfg.MyPublicIP).To4()
+		if realIP == nil {
+			log.Error("❌ my_public_ip نامعتبر", "value", cfg.MyPublicIP)
+			os.Exit(1)
+		}
+		log.Info("🌐 IP از config", "ip", realIP)
 	} else {
+		// تشخیص خودکار از route table — بدون HTTP request
 		if ipStr, err := cfgpkg.DetectOutboundIP(cfg.ServerAddr); err == nil {
 			realIP = net.ParseIP(ipStr).To4()
 		}
-		if realIP == nil || realIP.IsPrivate() {
-			if ipStr, err := cfgpkg.DetectPublicIP(); err == nil {
-				realIP = net.ParseIP(ipStr).To4()
-			}
-		}
 		if realIP == nil {
-			log.Error("❌ IP تشخیص داده نشد — با --my-public-ip مشخص کن")
+			log.Error("❌ IP تشخیص داده نشد — در client.json مشخص کن",
+				"field", "my_public_ip")
 			os.Exit(1)
 		}
-		log.Info("🌐 IP", "ip", realIP)
+		log.Info("🌐 IP (auto)", "ip", realIP)
 	}
 	udpAddr := &net.UDPAddr{IP: realIP, Port: cfg.DownloadPort}
 
@@ -610,8 +738,12 @@ func main() {
 	mux := newMux()
 	defer mux.Stop()
 
-	// UDP receiver
-	for i := 0; i < 2; i++ {
+	// UDP receiver — NumCPU goroutine برای ترافیک بالا
+	numRecv := runtime.NumCPU()
+	if numRecv < 2 {
+		numRecv = 2
+	}
+	for i := 0; i < numRecv; i++ {
 		go udpReceiver(ctx, tr, mux, log)
 	}
 
@@ -662,19 +794,22 @@ func main() {
 // ─── UDP receiver ────────────────────────────────────────────────────────────
 
 func udpReceiver(ctx context.Context, tr transport.Transport, mux *streamMux, log *slog.Logger) {
-	buf := make([]byte, 1500)
+	buf := make([]byte, 2048)
+	// deadline یه بار set — کاهش syscall overhead
+	tr.SetReadDeadline(time.Now().Add(24 * time.Hour))
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		tr.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, _, err := tr.Recv(buf)
+		if err != nil && ctx.Err() != nil {
+			return
+		}
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
+				continue // deadline-based — ادامه بده
 			}
+			if ctx.Err() != nil {
+				return
+			}
+			log.Debug("UDP recv error", "err", err)
 			return
 		}
 		if n < proto.UDPHdrSize {
@@ -684,8 +819,8 @@ func udpReceiver(ctx context.Context, tr transport.Transport, mux *streamMux, lo
 			continue
 		}
 		streamID := uint32(buf[2])<<16 | uint32(buf[3])<<8 | uint32(buf[4])
-		seq      := uint32(buf[5])<<16 | uint32(buf[6])<<8 | uint32(buf[7])
-		flags    := buf[8]
+		seq := uint32(buf[5])<<16 | uint32(buf[6])<<8 | uint32(buf[7])
+		flags := buf[8]
 
 		M.DownloadPackets.Add(1)
 		M.DownloadBytes.Add(uint64(n - proto.UDPHdrSize))
@@ -698,9 +833,17 @@ func udpReceiver(ctx context.Context, tr transport.Transport, mux *streamMux, lo
 			s.Close()
 			continue
 		}
-		pay := make([]byte, n-proto.UDPHdrSize)
+		// از pool برای payload — بازاستفاده به جای allocation جدید
+		payLen := n - proto.UDPHdrSize
+		payPtr := udpPayloadPool.Get().(*[]byte)
+		if cap(*payPtr) < payLen {
+			*payPtr = make([]byte, payLen)
+		}
+		pay := (*payPtr)[:payLen]
 		copy(pay, buf[proto.UDPHdrSize:n])
+		// reasm کپی میکنه — بعدش pool رو آزاد کن
 		s.rx.Load().Push(seq, flags, pay)
+		udpPayloadPool.Put(payPtr)
 	}
 }
 
@@ -717,7 +860,6 @@ func dialViaSocks5(proxy, dst string) (net.Conn, error) {
 		return nil, fmt.Errorf("proxy %s: %w", proxy, err)
 	}
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
-	defer conn.SetDeadline(time.Time{})
 	conn.Write([]byte{5, 1, 0})
 	resp := make([]byte, 2)
 	if _, err := io.ReadFull(conn, resp); err != nil || resp[1] != 0 {
@@ -741,6 +883,8 @@ func dialViaSocks5(proxy, dst string) (net.Conn, error) {
 		io.ReadFull(conn, lb)
 		io.ReadFull(conn, make([]byte, int(lb[0])+2))
 	}
+	// reset deadline بعد از handshake
+	conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 

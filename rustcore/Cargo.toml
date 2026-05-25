@@ -1,0 +1,20 @@
+[package]
+name = "qs-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "qscore"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# AES-GCM با AES-NI hardware acceleration
+aes-gcm = { version = "0.10", features = ["aes"] }
+# برای SIMD
+# بدون dependency خارجی برای proto/reasm
+
+[profile.release]
+opt-level = 3
+lto = true          # Link-Time Optimization
+codegen-units = 1   # بهترین optimization
+panic = "abort"     # کوچیک‌تر، سریع‌تر

@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QS-Tunnel · Dashboard</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
+
+:root {
+  --cyan: #00f5ff; --green: #00ff9f; --pink: #ff2d78;
+  --orange: #ff9500; --purple: #bf5fff; --yellow: #ffe600;
+  --bg: #020510; --card: rgba(0,245,255,0.04); --text: #e0f0ff; --dim: #6090aa;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg); font-family: 'Share Tech Mono', monospace;
+  color: var(--text); min-height: 100vh;
+  background-image:
+    linear-gradient(rgba(0,245,255,.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,245,255,.04) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+body::after {
+  content:''; position:fixed; inset:0; pointer-events:none;
+  background: repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.06) 3px,rgba(0,0,0,.06) 4px);
+  z-index:999;
+}
+
+/* Header */
+.header {
+  border-bottom: 1px solid rgba(0,245,255,.2);
+  padding: 16px 24px;
+  display: flex; align-items: center; justify-content: space-between;
+  background: rgba(0,245,255,.02);
+}
+.logo {
+  font-family: 'Orbitron', sans-serif; font-size: 20px; font-weight: 900;
+  color: var(--cyan); letter-spacing: 6px;
+  text-shadow: 0 0 10px var(--cyan), 0 0 30px rgba(0,245,255,.3);
+  animation: flicker 5s infinite;
+}
+.logo span { color: var(--pink); }
+.status-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 8px var(--green);
+  animation: pulse 2s infinite;
+}
+.uptime { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 10px; }
+
+@keyframes flicker { 0%,94%,100%{opacity:1} 95%{opacity:.6} 97%{opacity:.9} }
+@keyframes pulse { 0%,100%{opacity:1;box-shadow:0 0 8px var(--green)} 50%{opacity:.5;box-shadow:0 0 16px var(--green)} }
+
+/* Grid */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; padding: 20px 24px; }
+
+/* Stat card */
+.card {
+  border: 1px solid rgba(0,245,255,.15); border-radius: 6px;
+  background: var(--card); padding: 16px;
+  transition: box-shadow .3s;
+}
+.card:hover { box-shadow: 0 0 20px rgba(0,245,255,.15); }
+.card-label {
+  font-size: 10px; letter-spacing: 3px; color: var(--dim);
+  text-transform: uppercase; margin-bottom: 10px;
+}
+.card-value {
+  font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 700;
+  line-height: 1;
+}
+.card-sub { font-size: 11px; color: var(--dim); margin-top: 6px; }
+
+.c-cyan   .card-value { color:var(--cyan);   text-shadow:0 0 10px var(--cyan); }
+.c-green  .card-value { color:var(--green);  text-shadow:0 0 10px var(--green); }
+.c-pink   .card-value { color:var(--pink);   text-shadow:0 0 10px var(--pink); }
+.c-orange .card-value { color:var(--orange); text-shadow:0 0 10px var(--orange); }
+.c-purple .card-value { color:var(--purple); text-shadow:0 0 10px var(--purple); }
+.c-yellow .card-value { color:var(--yellow); text-shadow:0 0 10px var(--yellow); }
+
+/* Speed bars */
+.speed-section { padding: 0 24px 20px; }
+.speed-title { font-family:'Orbitron',sans-serif; font-size:11px; letter-spacing:3px; color:var(--dim); margin-bottom:14px; }
+
+.speed-row { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+.speed-label { width:80px; font-size:11px; color:var(--dim); }
+.speed-bar-wrap { flex:1; height:6px; background:rgba(255,255,255,.06); border-radius:3px; overflow:hidden; }
+.speed-bar { height:100%; border-radius:3px; transition: width .8s cubic-bezier(.4,0,.2,1); min-width:2px; }
+.speed-val { width:80px; font-size:12px; text-align:right; }
+.up-bar   { background: linear-gradient(90deg, var(--orange), var(--yellow)); box-shadow:0 0 6px var(--orange); }
+.dn-bar   { background: linear-gradient(90deg, var(--cyan), var(--green)); box-shadow:0 0 6px var(--cyan); }
+
+/* DNS section */
+.dns-section { padding: 0 24px 20px; }
+.dns-row { display:flex; justify-content:space-between; align-items:center; padding:8px 14px; border-radius:4px; background:rgba(0,245,255,.03); border:1px solid rgba(0,245,255,.08); margin-bottom:8px; font-size:12px; }
+.dns-key { color:var(--dim); }
+.dns-val { color:var(--cyan); font-family:'Orbitron',sans-serif; }
+.hit-rate { color:var(--green); }
+
+/* Chart */
+.chart-section { padding: 0 24px 20px; }
+.chart-wrap { border:1px solid rgba(0,245,255,.12); border-radius:6px; background:rgba(0,245,255,.02); padding:14px; }
+canvas { width:100% !important; }
+
+/* Footer */
+.footer { padding:12px 24px; border-top:1px solid rgba(0,245,255,.08); font-size:10px; color:var(--dim); display:flex; justify-content:space-between; letter-spacing:2px; }
+.refresh-badge { color:var(--cyan); }
+
+/* Corners */
+.corner { position:fixed; width:28px; height:28px; pointer-events:none; z-index:100; }
+.corner::before,.corner::after { content:''; position:absolute; background:var(--cyan); box-shadow:0 0 6px var(--cyan); }
+.corner::before { width:100%; height:2px; top:0; left:0; }
+.corner::after  { width:2px; height:100%; top:0; left:0; }
+.c-tl{top:8px;left:8px;} .c-tr{top:8px;right:8px;transform:scaleX(-1);}
+.c-bl{bottom:8px;left:8px;transform:scaleY(-1);} .c-br{bottom:8px;right:8px;transform:scale(-1);}
+</style>
+</head>
+<body>
+
+<div class="corner c-tl"></div><div class="corner c-tr"></div>
+<div class="corner c-bl"></div><div class="corner c-br"></div>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo">QS<span>·</span>TUNNEL</div>
+  <div class="uptime">
+    <div class="status-dot"></div>
+    <span id="uptime">--</span>
+  </div>
+</div>
+
+<!-- Stats Grid -->
+<div class="grid">
+  <div class="card c-cyan">
+    <div class="card-label">Active Streams</div>
+    <div class="card-value" id="activeStreams">--</div>
+    <div class="card-sub">Total: <span id="totalStreams">--</span></div>
+  </div>
+  <div class="card c-green">
+    <div class="card-label">Active Clients</div>
+    <div class="card-value" id="activeClients">--</div>
+    <div class="card-sub">Connected sessions</div>
+  </div>
+  <div class="card c-orange">
+    <div class="card-label">Upload</div>
+    <div class="card-value" id="uploadMB">--</div>
+    <div class="card-sub">MB total</div>
+  </div>
+  <div class="card c-pink">
+    <div class="card-label">Download</div>
+    <div class="card-value" id="downloadMB">--</div>
+    <div class="card-sub">MB total</div>
+  </div>
+  <div class="card c-purple">
+    <div class="card-label">Reconnects</div>
+    <div class="card-value" id="reconnects">--</div>
+    <div class="card-sub">Auto recovery</div>
+  </div>
+  <div class="card c-yellow">
+    <div class="card-label">Dial Errors</div>
+    <div class="card-value" id="dialErrors">--</div>
+    <div class="card-sub">Connection failures</div>
+  </div>
+</div>
+
+<!-- Speed -->
+<div class="speed-section">
+  <div class="speed-title">REALTIME THROUGHPUT</div>
+  <div class="speed-row">
+    <span class="speed-label" style="color:var(--orange)">⬆ Upload</span>
+    <div class="speed-bar-wrap"><div class="speed-bar up-bar" id="upBar" style="width:0%"></div></div>
+    <span class="speed-val" id="upSpeed" style="color:var(--orange)">-- KB/s</span>
+  </div>
+  <div class="speed-row">
+    <span class="speed-label" style="color:var(--cyan)">⬇ Download</span>
+    <div class="speed-bar-wrap"><div class="speed-bar dn-bar" id="dnBar" style="width:0%"></div></div>
+    <span class="speed-val" id="dnSpeed" style="color:var(--cyan)">-- KB/s</span>
+  </div>
+</div>
+
+<!-- DNS Cache -->
+<div class="dns-section">
+  <div class="speed-title">DNS CACHE</div>
+  <div class="dns-row">
+    <span class="dns-key">Cache Hits</span>
+    <span class="dns-val hit-rate" id="dnsHits">--</span>
+  </div>
+  <div class="dns-row">
+    <span class="dns-key">Cache Misses</span>
+    <span class="dns-val" id="dnsMisses">--</span>
+  </div>
+  <div class="dns-row">
+    <span class="dns-key">Hit Rate</span>
+    <span class="dns-val hit-rate" id="dnsHitRate">--%</span>
+  </div>
+  <div class="dns-row">
+    <span class="dns-key">Cached Entries</span>
+    <span class="dns-val" id="dnsCacheSize">--</span>
+  </div>
+</div>
+
+<!-- Bandwidth Chart -->
+<div class="chart-section">
+  <div class="speed-title">BANDWIDTH HISTORY (last 60s)</div>
+  <div class="chart-wrap">
+    <canvas id="chart" height="120"></canvas>
+  </div>
+</div>
+
+<div class="footer">
+  <span>QS-TUNNEL · MONITOR</span>
+  <span class="refresh-badge">AUTO REFRESH 2s</span>
+</div>
+
+<script>
+// chart data
+const MAX_POINTS = 60;
+const upData = new Array(MAX_POINTS).fill(0);
+const dnData = new Array(MAX_POINTS).fill(0);
+let canvas, ctx;
+let prevUp = 0, prevDn = 0;
+
+function initChart() {
+  canvas = document.getElementById('chart');
+  ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+  canvas.height = 120 * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+}
+
+function drawChart() {
+  const w = canvas.offsetWidth, h = 120;
+  ctx.clearRect(0, 0, w, h);
+
+  const maxVal = Math.max(...upData, ...dnData, 1);
+  const step = w / (MAX_POINTS - 1);
+
+  function drawLine(data, color, gColor) {
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = i * step;
+      const y = h - (v / maxVal) * (h - 10) - 5;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 4;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // fill
+    ctx.lineTo((MAX_POINTS-1)*step, h);
+    ctx.lineTo(0, h);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, gColor);
+    grad.addColorStop(1, 'transparent');
+    ctx.fillStyle = grad;
+    ctx.fill();
+  }
+
+  // grid lines
+  ctx.strokeStyle = 'rgba(0,245,255,0.06)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const y = (h / 4) * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  drawLine(dnData, '#00f5ff', 'rgba(0,245,255,0.12)');
+  drawLine(upData, '#ff9500', 'rgba(255,149,0,0.1)');
+
+  // labels
+  ctx.fillStyle = 'rgba(0,245,255,0.4)';
+  ctx.font = '10px Share Tech Mono';
+  ctx.fillText(formatSpeed(maxVal), 4, 14);
+}
+
+function formatSpeed(kbs) {
+  if (kbs >= 1024) return (kbs/1024).toFixed(1) + ' MB/s';
+  return kbs.toFixed(0) + ' KB/s';
+}
+
+function setBar(id, barId, val, maxKbs) {
+  document.getElementById(id).textContent = formatSpeed(val);
+  const pct = Math.min(val / maxKbs * 100, 100);
+  document.getElementById(barId).style.width = pct + '%';
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/stats');
+    const s = await r.json();
+
+    document.getElementById('uptime').textContent = s.uptime;
+    document.getElementById('activeStreams').textContent = s.active_streams;
+    document.getElementById('totalStreams').textContent = s.total_streams;
+    document.getElementById('activeClients').textContent = s.active_clients;
+    document.getElementById('uploadMB').textContent = s.upload_mb.toFixed(1);
+    document.getElementById('downloadMB').textContent = s.download_mb.toFixed(1);
+    document.getElementById('reconnects').textContent = s.reconnects;
+    document.getElementById('dialErrors').textContent = s.dial_errors;
+
+    // DNS
+    const hits = s.dns_hits || 0, misses = s.dns_misses || 0;
+    const total = hits + misses;
+    document.getElementById('dnsHits').textContent = hits;
+    document.getElementById('dnsMisses').textContent = misses;
+    document.getElementById('dnsHitRate').textContent = total ? (hits/total*100).toFixed(1)+'%' : '0%';
+    document.getElementById('dnsCacheSize').textContent = s.dns_cache_size || 0;
+
+    // Speed
+    const upKB = s.upload_speed_kb || 0;
+    const dnKB = s.download_speed_kb || 0;
+    const maxSpeed = 102400; // 100MB/s max display
+    setBar('upSpeed','upBar', upKB, maxSpeed);
+    setBar('dnSpeed','dnBar', dnKB, maxSpeed);
+
+    // Chart update
+    upData.push(upKB); upData.shift();
+    dnData.push(dnKB); dnData.shift();
+    drawChart();
+  } catch(e) {
+    document.getElementById('uptime').textContent = 'OFFLINE';
+  }
+}
+
+window.addEventListener('load', () => {
+  initChart();
+  refresh();
+  setInterval(refresh, 2000);
+});
+
+window.addEventListener('resize', () => {
+  canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+  canvas.height = 120 * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+  drawChart();
+});
+</script>
+</body>
+</html>

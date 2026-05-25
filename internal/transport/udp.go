@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/sttunnel/internal/spoof"
+	"github.com/Qteam-official/QS-Tunnel/internal/spoof"
 )
 
 // UDPTransport UDP ساده
@@ -100,4 +100,9 @@ func (t *UDPWithSpoof) LocalAddr() *net.UDPAddr {
 func (t *UDPWithSpoof) Close() error {
 	t.spoofer.Close()
 	return t.conn.Close()
+}
+
+// RawUDPConn دسترسی مستقیم به UDP connection برای sendmmsg
+func (t *UDPTransport) RawUDPConn() *net.UDPConn {
+	return t.conn
 }

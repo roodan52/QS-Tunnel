@@ -1,8 +1,8 @@
 // ObfsSpoofTransport — obfs + IP spoof با هم
 //
 // سرور از این استفاده میکنه وقتی هم transport=obfs هم spoof_ip داریم:
-//   1. payload رو با AES-256-GCM encrypt میکنه (همون نود obfs)
-//   2. frame رو با AF_PACKET و IP مبدا جعلی میفرسته
+//  1. payload رو با AES-256-GCM encrypt میکنه (همون نود obfs)
+//  2. frame رو با AF_PACKET و IP مبدا جعلی میفرسته
 //
 // کلاینت فقط ObfsTransport معمولی داره — spoof لازم نداره
 package transport
@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sttunnel/internal/spoof"
+	"github.com/Qteam-official/QS-Tunnel/internal/spoof"
 )
 
 // ObfsSpoofTransport

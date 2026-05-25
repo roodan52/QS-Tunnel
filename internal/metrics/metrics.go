@@ -33,6 +33,10 @@ type Counters struct {
 	// flow control
 	FlowAcksSent       atomic.Uint64
 	FlowAcksReceived   atomic.Uint64
+	FlowDrops          atomic.Uint64
+
+	// connection management
+	RejectedConns      atomic.Uint64
 
 	startTime time.Time
 }
@@ -58,6 +62,8 @@ type Snapshot struct {
 	ReassemblyDrops  uint64  `json:"reassembly_drops"`
 	FlowAcksSent     uint64  `json:"flow_acks_sent"`
 	FlowAcksReceived uint64  `json:"flow_acks_received"`
+	FlowDrops        uint64  `json:"flow_drops"`
+	RejectedConns    uint64  `json:"rejected_conns"`
 }
 
 func (c *Counters) Snapshot() Snapshot {
@@ -77,6 +83,8 @@ func (c *Counters) Snapshot() Snapshot {
 		ReassemblyDrops:  c.ReassemblyDrops.Load(),
 		FlowAcksSent:     c.FlowAcksSent.Load(),
 		FlowAcksReceived: c.FlowAcksReceived.Load(),
+		FlowDrops:        c.FlowDrops.Load(),
+		RejectedConns:    c.RejectedConns.Load(),
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sttunnel/internal/pool"
+	"github.com/Qteam-official/QS-Tunnel/internal/pool"
 )
 
 // ErrTCPDown باید از package stream import بشه — ولی چون circular میشه،
