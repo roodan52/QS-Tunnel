@@ -12,7 +12,7 @@
 
 <br/>
 
-[![Version](https://img.shields.io/badge/VERSION-2.0.0-00f5ff?style=for-the-badge&logo=github&logoColor=white&labelColor=020510)](https://github.com/Qteam-official/QS-Tunnel/releases)
+[![Version](https://img.shields.io/badge/VERSION-1.0.3-00f5ff?style=for-the-badge&logo=github&logoColor=white&labelColor=020510)](https://github.com/Qteam-official/QS-Tunnel/releases)
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white&labelColor=020510)](https://golang.org)
 [![Linux](https://img.shields.io/badge/Linux-5.1+-ff9500?style=for-the-badge&logo=linux&logoColor=white&labelColor=020510)](https://github.com/Qteam-official/QS-Tunnel)
 [![License](https://img.shields.io/badge/License-MIT-00ff9f?style=for-the-badge&labelColor=020510)](LICENSE)
